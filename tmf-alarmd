@@ -1,0 +1,594 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+
+use lib '/home/pi/perl5/lib/perl5';
+use WiringPi::API ();
+use LWP::UserAgent ();
+use HTTP::Daemon ();
+use IO::Select ();
+use My::Systemd qw( sd_watchdog );
+use IO::Select ();
+
+# TODO:
+# finish UI
+# - Add extra confirmation (and delay beofre activating) external alarm 
+# -- can we stop the periodic calling when the page is laoded but not being viewed?
+# move UI to this file and read as <DATA>
+# persist the external alarm state over a restart/reboot?
+
+# Configuration
+my $homedir             = '/home/pi/alarm';
+
+my $pushover_url        = 'https://api.pushover.net/1/messages.json';
+my $pushover_api_token  = 'ack9tzso3i74jm91wgrt216mg64s56';
+my $pushover_user_key   = 'ukrmipmgpbwxotxywbyuqghbsrr7i5';
+my @messages;
+
+my $statuscake_url      = 'https://push.statuscake.com/?PK=74c07fca21ff655&TestID=5535630&time=0';
+
+my $ua_agent            = 'TMF-alarmd/0.01 ';
+my $host                = 'tmf-alarm-01.local';
+my $localPort           = 8080;
+my $ui_base_url         = "http://${host}:${localPort}/";
+my $ui_status_url       = "/status";
+my $ui_ext_on_url       = "/trigger-alarm";
+my $ui_ext_off_url      = "/untrigger-alarm";
+
+debug("Starting ...");
+debug("... creating the user agent");
+my $ua = LWP::UserAgent->new( agent => $ua_agent );
+
+debug("... creating the http server for the UI");
+my $httpd = HTTP::Daemon->new(
+    LocalPort => $localPort,
+    ReuseAddr => 1);
+my $select = IO::Select->new();
+if ($httpd) {
+    $select->add($httpd);
+    info("... http server listening on port $localPort");
+}
+else {
+    warning("Failed to create tmf-alarmd HTTP Server: $!");
+}
+my $ui = do {local $/; <DATA>; }; # Read in teh UI from teh end of this file
+
+######################################################################
+# Here starts the Daemon proper ..
+######################################################################
+notice("Starting main process ...");
+
+debug("... setting up signal handlers");
+# SIGINT & SIGTERM to terminate the process
+$SIG{INT}  = sub { info("terminating due to SIGINT(^C)"); exit; };
+$SIG{TERM} = sub { info("terminating due to SIGTERM"); exit; };
+
+# Determinte if and how often we need to send watchdog messages
+my $next_wd_time = 0;
+my $wd_interval  = 0;
+if(exists $ENV{WATCHDOG_USEC}) {
+    # TODO better validation of the incoming value - should probably check numeric and within sensible range
+    # For now let's just trust that systemd sets teh environment correctly
+    $wd_interval = $ENV{WATCHDOG_USEC} / 2_000_000; #Best practice appears to be to use half the period
+    debug("... watchdog interval set to $wd_interval seconds.");
+    $next_wd_time = time + $wd_interval;
+}
+
+debug("... setting up HW pins for IO.");
+# Initial setup and configuration
+# Set up the pins:
+#                NC -  3 4  - 5v
+#                NC -  5 6  - 0v
+#     GPIO.7 (Fire) -  7 8  - NC
+#                0v -  9 10 - NC
+#       GPIO.0 (CO) - 11 12 - (Alarm) GPIO.1
+# GPIO.2 (Service)) - 13 14 - 0v
+
+use constant {
+    FIRE        => 0,
+    CO          => 1,
+    SERVICE     => 2,
+    ALARM       => 3,
+    MAX_INDEX   => 3,
+
+    FIRE_PIN    => 7,
+    CO_PIN      => 0,
+    SERVICE_PIN => 2,
+    ALARM_PIN   => 1,
+
+    INPUT       => 0,
+    OUTPUT      => 1,
+
+    PULL_UP     => 2,
+    EDGE_BOTH   => 3,
+
+    OFF         => 0,
+    ON          => 1,
+
+    STATUS_INTERVAL => 5 * 60,
+};
+
+use constant PINS        => ( FIRE_PIN, CO_PIN, SERVICE_PIN, ALARM_PIN, );
+use constant PIN_MODES   => ( INPUT,    INPUT,  INPUT,       OUTPUT,    );
+use constant MSGS        => ( 'Fire alarm', 'CO alarm', 'Service warning', );
+
+my $api = WiringPi::API->new(); $api->setup(); # setup to use WiringPi pin numbering
+
+# Set up pins
+for my $pin ( 0 .. MAX_INDEX ) {
+    $api->pin_mode    ((PINS)[$pin], (PIN_MODES)[$pin]);
+    $api->pull_up_down((PINS)[$pin], PULL_UP) if (PIN_MODES)[$pin] == INPUT;
+    $api->write_pin   ((PINS)[$pin], OFF)     if (PIN_MODES)[$pin] == OUTPUT;;
+}
+
+# Initial state
+my @triggered = (1,1,1); # pin states deafult ot high and are pulled low when activated
+my $alarm = OFF;
+my $next_status_time = time - 1; # ensure we get an initial status ping
+
+info("... entering event loop.");
+while(1) {
+    # Sadly WiringPi::API::set_interrupt() is badly borked,
+    # so we have to poll for change.  Fortunately speed isn't
+    # important
+    #
+    # Read the input pins, see if anything changed.  If it did,
+    # then log and raise a noification
+    
+    for my $pin ( FIRE, CO, SERVICE ) {
+        my $t = $api->read_pin((PINS)[$pin]);
+
+        if($t != $triggered[$pin]) {
+            if($t) {
+                # relay open
+                alert( (MSGS)[$pin] . " reset");
+            }
+            else {
+                # relay closed
+                crit( (MSGS)[$pin] . " activated");
+            }
+            $triggered[$pin] = $t;
+        }
+    }
+
+    # send any pending push notifications
+    # TODO - do we need to rate limit calling this in the case that we're having problems sending?
+    send_pending_messages();
+
+    # Ping systemd every $wd_interval seconds
+    if( ($wd_interval > 0) && ($next_wd_time < time)) {
+        $next_wd_time += $wd_interval;
+        sd_watchdog(); # send WATCHDOG=1 to systemd
+    }
+
+    # Ping statuscake.com every STATUS_INTERVAL minutes so we know the
+    # service is alive
+    if($next_status_time < time) {
+        $next_status_time += STATUS_INTERVAL;
+        my $res = $ua->get($statuscake_url);
+        if(!$res->is_success) {
+            warning("Failed talking to '$statuscake_url': ", $res->status_line);
+        }
+    }
+
+    # Service the UI (HTTP Requests), if there  are any
+    # TODO beef this up to help prevent DOS attacks.  Possibly queue of 1?  Anything else?
+    # Should probably at least add a token to make calling the API harder?  Any point if it's available from
+    # the UI HTML code?
+    my @ready = $select->can_read(0.1); # Sleep for 100ms if there are no UI requests to process
+    foreach my $connection (@ready) {
+        if ($connection == $httpd) {
+            # on the daemon so accept and add the connection
+            my $client = $connection->accept();
+            $select->add($client);
+        }
+        else {
+            # is a client connection
+            my $request = $connection->get_request();
+            if ($request) {
+                my $response;
+                if($request->uri =~ /^\/(?:index\.htm(?:l)?)?$/ ) {
+                    # process the request '/'
+                    $response = HTTP::Response->new( 200, 'OK');
+                    $response->header('Content-Type' => 'text/html'),
+                    $response->content($ui);
+                    $connection->send_response($response);
+                }
+                elsif($request->uri eq $ui_status_url) {
+                    $response = HTTP::Response->new( 200, 'OK');
+                    $response->header('Content-Type' => 'application/json'),
+                    $response->content("{ \"Fire\": " . ($triggered[FIRE] ? "0" : "1") . ", \"CO\": " . ($triggered[CO] ? "0" : "1") . ", \"Service\": " . ($triggered[SERVICE] ? "0" : "1") . ", \"External\": $alarm }");
+                    $connection->send_response($response);
+                }
+                elsif($request->uri eq $ui_ext_on_url) {
+                    if($alarm != ON) {
+                        $alarm = ON;
+                        alert( "External alarm detected, turning on fire alarm");
+                        $api->write_pin(ALARM_PIN, ON);
+                    }
+                    $response = HTTP::Response->new( 200, 'OK');
+                    $response->header('Content-Type' => 'text/html'),
+                    $response->content("External Alarm ON");
+                    $connection->send_response($response);
+                }
+                elsif($request->uri eq $ui_ext_off_url) {
+                    if($alarm != OFF) {
+                        $alarm = OFF;
+                        crit( "Turning off external alarm");
+                        $api->write_pin(ALARM_PIN, OFF);
+                    }
+                    $response = HTTP::Response->new( 200, 'OK');
+                    $response->header('Content-Type' => 'text/html'),
+                    $response->content("External Alarm OFF");
+                    $connection->send_response($response);
+                }
+                else {
+                    # All other requets get a 404 Not Found
+                    $connection->send_error(404, "Resource not found");
+                }
+            }
+            else {
+                # connection closed by the client
+                $select->remove($connection);
+                $connection->close();  # probably not necessary
+            }
+        } # end processing connections with data
+    }
+}
+
+#loging helpers
+#i The follwoing may be pre-fixed to stdout/stderr messages to get the appropriate level in syslog
+#define SD_EMERG   "<0>"  /* system is unusable */
+#define SD_ALERT   "<1>"  /* action must be taken immediately */
+#define SD_CRIT    "<2>"  /* critical conditions */
+#define SD_ERR     "<3>"  /* error conditions */
+#define SD_WARNING "<4>"  /* warning conditions */
+#define SD_NOTICE  "<5>"  /* normal but significant condition */
+#define SD_INFO    "<6>"  /* informational */
+#define SD_DEBUG   "<7>"  /* debug-level messages */
+
+sub debug {
+    mylog("<7>", @_);
+}
+sub info {
+    mylog("<6>", @_);
+}
+sub notice {
+    mylog("<5>", @_);
+    notify_pushover(@_);
+}
+sub warning {
+    mylog("<4>", @_);
+    notify_pushover("warn: ", @_);
+}
+sub warning_no_pushover {
+    mylog("<4>", @_);
+}
+sub error {
+    mylog("<3>", @_);
+    notify_pushover("error: ", @_);
+}
+sub crit {
+    mylog("<2>", @_);
+    notify_pushover("Critical: ", @_);
+}
+sub alert {
+    mylog("<1>", @_);
+    notify_pushover("ALERT: ", @_);
+}
+sub mylog {
+    print STDERR @_, "\n";
+}
+
+# notify via Pushover - adds the message to the queue to be sent to pushover
+sub notify_pushover {
+    my $msg = join('', @_);
+    my $time = time;
+    push @messages, [$time, $msg];
+
+    # Keep only 10 items in the queue
+    while(scalar(@messages) > 10) {
+        shift @messages;
+        warning_no_pushover("discarding pushover message");
+    }
+}
+
+sub send_pending_messages {
+    while(my $m = shift @messages) {
+        my ($time, $msg) = @$m;
+
+        # If the message is delayed then let me know
+        my $delay = time - $time;
+        if ($delay > 0) {
+            $msg .= " [delayed by ${delay}s]";
+        }
+
+        if(!send_pushover_message($msg, $time)) {
+            unshift @messages, $m; # put it back
+            last; # If we failed to send a message, then stop and we'll try again later
+        }
+    }
+}
+
+sub send_pushover_message {
+        my ($msg, $time) = @_;
+
+        my $pushover_args = [
+                token     => $pushover_api_token,
+                user      => $pushover_user_key,
+                timestamp => $time,
+                message   => $msg,
+                url_title => 'TMF Alarm Console',
+                url       => $ui_base_url,
+        ];
+
+        my $res = $ua->post($pushover_url, $pushover_args);
+
+        if (!$res->is_success) {
+            warning_no_pushover("Failed talking to '$pushover_url': ", $res->status_line);
+            return 0;
+        }
+        # TODO check success response for errors ...
+        # "status":1  will be in the JSON response for success,  For failyre status ither than 1, and errors array with text describing the problem(s)
+        # HTTP Status response 429 indicate message limit has been exceeded - no more until the 1st of the next month
+        # For 4XX responses we shoudl probably stop sending
+
+        return 1;
+}
+__END__
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TFM Alarms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 60px;
+  height: 34px;
+}
+
+.switch input { 
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #ccc;
+  -webkit-transition: .4s;
+  transition: .4s;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 26px;
+  width: 26px;
+  left: 4px;
+  bottom: 4px;
+  background-color: white;
+  -webkit-transition: .4s;
+  transition: .4s;
+}
+
+input:checked + .slider {
+  background-color: #2196F3;
+}
+
+input:focus + .slider {
+  box-shadow: 0 0 1px #2196F3;
+}
+
+input:checked + .slider:before {
+  -webkit-transform: translateX(26px);
+  -ms-transform: translateX(26px);
+  transform: translateX(26px);
+}
+
+/* Rounded sliders */
+.slider.round {
+  border-radius: 34px;
+}
+
+.slider.round:before {
+  border-radius: 50%;
+}
+
+img {
+	margin: 3px;
+	padding: 10px;
+}
+
+body {
+	text-align: center;
+}
+
+.header {
+	font-size: 30px;
+	font-weight: bold;
+	padding: 10px 0px 10px 0px;
+}
+.status {
+	font-size: 18px;
+	padding: 10px 0px 10px 0px;
+}
+.footer {
+	font-size: 11px;
+	padding: 10px 0px 10px 0px;
+}
+.inline {
+	display: inline-block;
+}
+.alert {
+	background-color: red;
+}
+.ok {
+	background-color: lime;
+}
+.warn {
+	background-color: yellow;
+}
+.clear {
+	background-color: white;
+}
+</style>
+<script>
+var t = 0;
+var o = JSON.parse('{ "Fire":0, "Service":0, "CO":0, "External":0 }');
+var flash_time;
+
+function initialise() {
+	request = new XMLHttpRequest();
+	request.open("GET", "/status");
+	request.responseTYpe = "json";
+	request.onload = function() {
+		var n = JSON.parse(request.response);
+
+		if(n.External == 1) {
+			document.getElementById("external").checked = true;
+		}
+		else {
+			document.getElementById("external").checked = false;
+		}
+
+		updateState();
+
+		setInterval(updateState, 5000);
+	};
+	request.send();
+};
+
+function updateState() {
+	request = new XMLHttpRequest();
+	request.open("GET", "/status");
+	request.responseTYpe = "json";
+	request.onload = function() {
+		var n = JSON.parse(request.response);
+
+		if((o.Fire == n.Fire) && (o.Service == n.Service) && (o.CO == n.CO)) {
+			// no change in state
+			return;
+		}
+		o = n;
+
+		if(o.Fire == 0 && o.Service == 0 && o.CO == 0) {
+			// stop timer and set state
+			clearInterval(flash_timer);
+			setState();
+		}
+		else {
+			// start time and set state
+			setState();
+			flash_timer = setInterval(setState, 500);
+		}
+	};
+	request.send();
+};
+
+function setState() {
+	t = (t + 1) % 2;
+	var status = "";
+	if(o.Fire == 1) {
+		if(t == 1) {
+			document.getElementById("Fire").className = "clear";
+		}
+		else {
+			document.getElementById("Fire").className = "alert";
+		}
+		status += "Fire Alarm is Sounding. ";
+		if(o.External == 1) {
+			status += "(external trigger) ";
+		}
+	}
+	else {
+		document.getElementById("Fire").className = "ok";
+	}
+
+	if(o.CO == 1) {
+		if(t == 1) {
+			document.getElementById("CO").className = "clear";
+		}
+		else {
+			document.getElementById("CO").className = "alert";
+		}
+		status += "CO Alarm is Sounding. ";
+	}
+	else {
+		document.getElementById("CO").className = "ok";
+	}
+
+	if(o.Service == 1) {
+		if(t == 1) {
+			document.getElementById("Service").className = "clear";
+		}
+		else {
+			document.getElementById("Service").className = "warn";
+		}
+		status += "Alarm system needs servicing. ";
+	}
+	else {
+		document.getElementById("Service").className = "ok";
+	}
+
+	if(status == "") {
+		document.getElementById("status").innerHTML = "All quiet.";
+	}
+	else {
+		document.getElementById("status").innerHTML = status;
+	}
+
+};
+
+function doChangeExternalState(checkboxElem) {
+	h = new XMLHttpRequest();
+	if (checkboxElem.checked) {
+		h.open("GET", "/trigger-alarm");
+	}
+	else {
+		h.open("GET", "/untrigger-alarm");
+	}
+	h.send();
+}
+
+</script>
+</head>
+<body onload="initialise()">
+<div class="header">TMF Alarm Panel</div>
+
+<div class="inline">
+<!-- Fire Image -->
+<img id="Fire" class="ok" src="data:image/png;base64,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" alt="Fire Alarm" />
+<!-- Service Image -->
+<img id="Service" class="ok" src="data:image/png;base64,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" alt="Service" />
+<!-- CO Image -->
+<img id="CO" class="ok" src="data:image/png;base64,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" alt="CO Alarm" />
+</div>
+
+<div></div>
+
+<div class="inline">
+    <span style="vertical-align:middle;font-size:30px">External Alarm:</span>
+    <span style="vertical-align:middle">
+        <label class="switch">
+            <input id="external" type="checkbox" unchecked onchange="doChangeExternalState(this)">
+            <span class="slider round"></span>
+        </label>
+    </span>
+</div>
+
+
+<div class="status" id="status">All quiet.</div>
+
+<div class="footer">Icons made by <a href="https://www.flaticon.com/authors/freepik" title="Freepik">Freepik</a> from <a href="https://www.flaticon.com/" title="Flaticon"> www.flaticon.com</a></div>
+</body>
+</html> 
+

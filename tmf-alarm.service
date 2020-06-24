@@ -1,0 +1,38 @@
+# systemd service configuration for tmf-alarm
+#
+# cp tmf-alarm.service /etc/systemd/system
+# mak sure the start script is executable
+#
+# start the service:               sudo systemctl start tmf-alarm.service
+# stop the service:                sudo systemctl stop tmf-alarm.service
+# make the service run at startup: sudo systemctl enable tmf-alarm.service
+
+
+[Unit]
+Description=TMF Alarm monitor
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/home/pi/alarm/tmf-alarmd
+
+WatchdogSec=60
+NotifyAccess=main
+
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitInterval=120
+StartLimitAction=reboot
+
+StandardInput=null
+StandardOutput=null
+StandardError=syslog
+SyslogIdentifier=tmf-alarmd
+SyslogFacility=daemon
+SyslogLevel=debug
+SyslogLevelPrefix=on
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+1. HW Watchdog
+- add dtparm=watchdog=on to /boot/congif.txt (this may not be necessary?)
+- in /etc/systemd/system.comf set:
+-- RuntimeWatchdogSec=30
+-- ShutdownWatchdogSec=10min (default)
+
+2. Turn off audio
+- comment out dtparam=audio=on in /boot/config.txt
+
+3. Add tmf-alarm service
+- cp tmf-alarm.service /etc/systemd/system/
+- systemctl start tmf-alarm
+- systemctl enable tmf-alarm
+
+4. Install WiringPi and Perl wrapper
+- sudo apt-get install wiringpi
+- sudo apt-get install cpanm
+- [configure local install using lib::local, including adding to .profile]
+- cpanm WiringPi::API
+
+5. Edit /etc/rsyslogd.conf to send messages to Papertrail:
+- add line at end:
+- # notify phone via Pushover
+- *.* @logs2.papertrailapp.com:53239
+
+6. Making My:Systemd
+- sudo apt-get install libsystemd-dev
+
+7. Install LWP::UserAgent
+- sudo apt-get install libwww-perl
+
+8. Install ntpd, and disaple existing time service
+- sudo apt-get install ntpd
+- sudo timedatectl set-ntp false
+
+9. Turn off teh HMDI hardwar
+- sudo /opt/vc/bin/tvservice -o
+- see rpi_no_hdmi.service

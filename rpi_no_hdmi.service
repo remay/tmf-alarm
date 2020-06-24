@@ -1,0 +1,16 @@
+# To save a little power on a headless rPi enable this to turn
+# off the HDMI hardware at boot
+# sudo cp rpi_no_hdmi.service /etc/systemd/system
+# sudo systemctl enable service rpi_no_hdmi
+
+[Unit]
+Description=Disable Raspberry Pi HDMI port
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vc/bin/tvservice -o
+ExecStop=/opt/vc/bin/tvservice -p
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
