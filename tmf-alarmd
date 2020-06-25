@@ -22,11 +22,11 @@ use IO::Select ();
 my $homedir             = '/home/pi/alarm';
 
 my $pushover_url        = 'https://api.pushover.net/1/messages.json';
-my $pushover_api_token  = 'ack9tzso3i74jm91wgrt216mg64s56';
-my $pushover_user_key   = 'ukrmipmgpbwxotxywbyuqghbsrr7i5';
+my $pushover_api_token  = 'XXX';
+my $pushover_user_key   = 'XXX';
 my @messages;
 
-my $statuscake_url      = 'https://push.statuscake.com/?PK=74c07fca21ff655&TestID=5535630&time=0';
+my $statuscake_url      = 'https://push.statuscake.com/?PK=XXX&TestID=XXX&time=0';
 
 my $ua_agent            = 'TMF-alarmd/0.01 ';
 my $host                = 'tmf-alarm-01.local';
@@ -52,7 +52,7 @@ if ($httpd) {
 else {
     warning("Failed to create tmf-alarmd HTTP Server: $!");
 }
-my $ui = do {local $/; <DATA>; }; # Read in teh UI from teh end of this file
+my $ui = do {local $/; <DATA>; }; # Read in the UI from the end of this file
 
 ######################################################################
 # Here starts the Daemon proper ..
@@ -69,7 +69,7 @@ my $next_wd_time = 0;
 my $wd_interval  = 0;
 if(exists $ENV{WATCHDOG_USEC}) {
     # TODO better validation of the incoming value - should probably check numeric and within sensible range
-    # For now let's just trust that systemd sets teh environment correctly
+    # For now let's just trust that systemd sets the environment correctly
     $wd_interval = $ENV{WATCHDOG_USEC} / 2_000_000; #Best practice appears to be to use half the period
     debug("... watchdog interval set to $wd_interval seconds.");
     $next_wd_time = time + $wd_interval;
