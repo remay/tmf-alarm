@@ -23,7 +23,8 @@ NotifyAccess=main
 Restart=always
 RestartSec=10
 StartLimitBurst=5
-StartLimitInterval=120
+StartLimitInterval=360
+#StartLimitInterval needs to be at least (StartLimitBurst*WatchDogSec) so that the watchdog can cause a reboot
 StartLimitAction=reboot
 
 StandardInput=null
