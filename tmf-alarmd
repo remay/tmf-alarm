@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-use lib '/home/pi/perl5/lib/perl5';
+#use lib '/home/pi/perl5/lib/perl5';
 use WiringPi::API ();
 use LWP::UserAgent ();
 use HTTP::Daemon ();
@@ -14,8 +14,8 @@ use IO::Select ();
 # TODO:
 # finish UI
 # - Add extra confirmation (and delay beofre activating) external alarm 
-# -- can we stop the periodic calling when the page is laoded but not being viewed?
-# move UI to this file and read as <DATA>
+# - Or a password to trigger the alarm?  Does that deal with the worst abuse cases?
+# -- can we stop the periodic calling when the page is loaded but not being viewed?
 # persist the external alarm state over a restart/reboot?
 
 # Configuration
@@ -38,7 +38,9 @@ my $ui_ext_off_url      = "/untrigger-alarm";
 
 debug("Starting ...");
 debug("... creating the user agent");
-my $ua = LWP::UserAgent->new( agent => $ua_agent );
+my $ua = LWP::UserAgent->new( agent => $ua_agent,
+                              timeout => 10,      # short enough that external comms failures don't trip the watchdog
+                          );
 
 debug("... creating the http server for the UI");
 my $httpd = HTTP::Daemon->new(
@@ -123,7 +125,7 @@ for my $pin ( 0 .. MAX_INDEX ) {
 }
 
 # Initial state
-my @triggered = (1,1,1); # pin states deafult ot high and are pulled low when activated
+my @triggered = (1,1,1); # pin states default to high and are pulled low when activated
 my $alarm = OFF;
 my $next_status_time = time - 1; # ensure we get an initial status ping
 
@@ -152,15 +154,15 @@ while(1) {
         }
     }
 
-    # send any pending push notifications
-    # TODO - do we need to rate limit calling this in the case that we're having problems sending?
-    send_pending_messages();
-
     # Ping systemd every $wd_interval seconds
     if( ($wd_interval > 0) && ($next_wd_time < time)) {
         $next_wd_time += $wd_interval;
         sd_watchdog(); # send WATCHDOG=1 to systemd
     }
+
+    # send any pending push notifications
+    # TODO - do we need to rate limit calling this in the case that we're having problems sending?
+    send_pending_messages();
 
     # Ping statuscake.com every STATUS_INTERVAL minutes so we know the
     # service is alive
@@ -238,7 +240,7 @@ while(1) {
 }
 
 #loging helpers
-#i The follwoing may be pre-fixed to stdout/stderr messages to get the appropriate level in syslog
+#The follwoing may be pre-fixed to stdout/stderr messages to get the appropriate level in syslog
 #define SD_EMERG   "<0>"  /* system is unusable */
 #define SD_ALERT   "<1>"  /* action must be taken immediately */
 #define SD_CRIT    "<2>"  /* critical conditions */
@@ -295,6 +297,7 @@ sub notify_pushover {
 }
 
 sub send_pending_messages {
+    # XXX We should rate limit failures - currently this can get called every 100ms or so.
     while(my $m = shift @messages) {
         my ($time, $msg) = @$m;
 
@@ -306,7 +309,7 @@ sub send_pending_messages {
 
         if(!send_pushover_message($msg, $time)) {
             unshift @messages, $m; # put it back
-            last; # If we failed to send a message, then stop and we'll try again later
+            return; # If we failed to send a message, then stop and we'll try again later
         }
     }
 }
@@ -330,7 +333,7 @@ sub send_pushover_message {
             return 0;
         }
         # TODO check success response for errors ...
-        # "status":1  will be in the JSON response for success,  For failyre status ither than 1, and errors array with text describing the problem(s)
+        # "status":1  will be in the JSON response for success,  For failure status other than 1, an errors array with text describing the problem(s)
         # HTTP Status response 429 indicate message limit has been exceeded - no more until the 1st of the next month
         # For 4XX responses we shoudl probably stop sending
 
